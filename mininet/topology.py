@@ -1,75 +1,46 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
-import time
-from mininet.topo import Topo
 from mininet.net import Mininet
-from mininet.node import RemoteController
+from mininet.node import Controller, RemoteController
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
+from mininet.link import TCLink, Intf # Import Intf
+from mininet.topo import Topo
 
-class AI_SDN_Topo(Topo):
-    """Custom topology for the AI-SDN Project."""
-    def build(self):
-        # Adding switches
-        s1 = self.addSwitch('s1', dpid='0000000000000001')
-        s2 = self.addSwitch('s2', dpid='0000000000000002')
-        s3 = self.addSwitch('s3', dpid='0000000000000003')
-        s4 = self.addSwitch('s4', dpid='0000000000000004')
+def myNetwork():
+    # Use RemoteController since our controller is running outside Mininet
+    info('*** Adding controller\n')
+    # Use the VM's actual IP address
+    c0 = RemoteController('c0', ip='192.168.64.4', port=6633)
 
-        # Adding hosts
-        h1 = self.addHost('h1', ip='10.0.1.1/24')
-        h2 = self.addHost('h2', ip='10.0.1.2/24')
-        server = self.addHost('server', ip='10.0.2.1/24')
-        attacker1 = self.addHost('attacker1', ip='10.0.3.1/24')
-        attacker2 = self.addHost('attacker2', ip='10.0.3.2/24')
+    info('*** Creating a network\n')
+    net = Mininet(controller=c0, link=TCLink) # Use TCLink for traffic shaping later if needed
 
-        # Creating links
-        self.addLink(h1, s1)
-        self.addLink(h2, s1)
-        self.addLink(server, s2)
-        self.addLink(attacker1, s3)
-        self.addLink(attacker2, s3)
-        self.addLink(s1, s4)
-        self.addLink(s2, s4)
-        self.addLink(s3, s4)
+    info('*** Adding hosts and switch\n')
+    h1 = net.addHost('h1', ip='10.0.0.1/24') # Assign static IPs
+    h2 = net.addHost('h2', ip='10.0.0.2/24')
+    s1 = net.addSwitch('s1')
 
-def run_congestion_test():
-    """Creates the network and runs the congestion test."""
-    topo = AI_SDN_Topo()
-    # Use RemoteController since your OS-Ken controller is running separately
-    net = Mininet(topo=topo, controller=RemoteController('c0', ip='127.0.0.1'))
+    info('*** Creating links\n')
+    net.addLink(h1, s1)
+    net.addLink(h2, s1)
 
-    info("*** Starting network\n")
+    info('*** Starting network\n')
     net.start()
+    
+    # This is the crucial part that was missing.
+    # It disables the default IP on the switch's control interface...
+    s1.cmd('ifconfig s1-eth1 0')
+    # ...and makes sure the switch can communicate with the controller.
+    s1.cmd('ovs-vsctl set-controller s1 tcp:192.168.64.4:6633')
 
-    # Get host objects
-    server = net.get('server')
-    h1 = net.get('h1')
-    h2 = net.get('h2')
 
-    TEST_DURATION = 60
-    LOG_FILE = "congestion_ping_log.txt"
+    info('*** Running CLI\n')
+    CLI(net)
 
-    info(f"*** Starting iperf server on {server.name}\n")
-    # The '.cmd()' method runs a command on the host
-    server.cmd(f'iperf -s > /dev/null &')
-
-    info(f"*** Starting ping from {h2.name} to {server.name}\n")
-    h2.cmd(f'ping {server.IP()} > {LOG_FILE} &')
-
-    info(f"*** Starting iperf clients from {h1.name} and {h2.name}\n")
-    h1.cmd(f'iperf -c {server.IP()} -t {TEST_DURATION} -b 10M > /dev/null &')
-    h2.cmd(f'iperf -c {server.IP()} -t {TEST_DURATION} -b 10M > /dev/null &')
-
-    info(f"--- Test is running for {TEST_DURATION} seconds. ---\n")
-    time.sleep(TEST_DURATION)
-
-    info("*** Test finished. Cleaning up.\n")
+    info('*** Stopping network\n')
     net.stop()
 
 if __name__ == '__main__':
     setLogLevel('info')
-    run_congestion_test()
-
-# This exposes the topology to the 'mn' command if you ever need it
-topos = {'aisdntopo': (lambda: AI_SDN_Topo())}
+    myNetwork()
