@@ -9,7 +9,7 @@ ryu
 # -----------------------------------------------------------------
 # Main deep learning framework for running .keras models
 tensorflow
-
+flask
 # Used for scalers, the ExtraTreesClassifier, and metrics.
 # Version is pinned to ensure compatibility with your saved .joblib files.
 scikit-learn==1.3.2

@@ -1,1 +1,3 @@
-source /home/prajyoth/sdn_env/bin/activate
+source /home/prajyoth/sdn/bin/activate
+
+source /home/prajyoth/ai-venv/bin/activate

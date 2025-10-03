@@ -1,6 +1,4 @@
-# osken_app/ai_pipeline.py
-
-import tensorflow as tf
+import keras
 import joblib
 import pickle
 import numpy as np
@@ -24,7 +22,7 @@ class AIPipeline:
         """Initializes the AI pipeline by loading all models and scalers."""
         try:
             # --- Load Autoencoder Components ---
-            self.autoencoder = tf.keras.models.load_model(os.path.join(model_dir, 'autoencoder_model.keras'))
+            self.autoencoder = keras.models.load_model(os.path.join(model_dir, 'autoencoder_model.keras'))
             
             ae_scaler_path = os.path.join(model_dir, 'scalers/autoencoder/')
             # Use pickle to load the threshold file
@@ -46,7 +44,7 @@ class AIPipeline:
 
             # --- Load DDoS Classifier Components ---
             ddos_scaler_path = os.path.join(model_dir, 'scalers/ddos/')
-            self.ddos_model = tf.keras.models.load_model(os.path.join(model_dir, 'ddos_model.keras'))
+            self.ddos_model = keras.models.load_model(os.path.join(model_dir, 'ddos_model.keras'))
             self.forest_embedder = joblib.load(os.path.join(model_dir, 'forest_embedder.joblib'))
             self.ddos_scaler = joblib.load(os.path.join(ddos_scaler_path, 'ddos_scaler.joblib'))
             # Use pickle to load the max value file
