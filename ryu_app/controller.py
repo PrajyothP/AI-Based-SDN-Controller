@@ -151,21 +151,19 @@ class AIController(app_manager.RyuApp):
                 packets_per_second = data['fwd_packets'] / duration
 
                 feature_dict = {
+                    # Common features for both models
                     "Destination Port": flow_key[2],
-                    "Flow Duration": duration, "Total Fwd Packets": data['fwd_packets'],
-                    "Total Backward Packets": 0, "Total Length of Fwd Packets": data['fwd_bytes'],
-                    "Total Length of Bwd Packets": 0,
+                    "Flow Duration": duration,
+                    "Total Fwd Packets": data['fwd_packets'],
+                    "Total Backward Packets": 0, # Unidirectional flow assumption
+                    "Total Length of Fwd Packets": data['fwd_bytes'],
+                    "Total Length of Bwd Packets": 0, # Unidirectional flow assumption
+                    # Features for specific models
                     "Packet Length Mean": data['fwd_bytes'] / data['fwd_packets'] if data['fwd_packets'] > 0 else 0,
                     "Flow Packets/s": packets_per_second,
-                    " Fwd Packet Length Mean": data['fwd_bytes'] / data['fwd_packets'] if data['fwd_packets'] > 0 else 0,
-                    " Bwd Packet Length Mean": 0,
+                    "Fwd Packet Length Mean": data['fwd_bytes'] / data['fwd_packets'] if data['fwd_packets'] > 0 else 0,
+                    "Bwd Packet Length Mean": 0, # Unidirectional flow assumption
                 }
-                feature_dict[" Flow Duration"] = feature_dict["Flow Duration"]
-                feature_dict[" Total Fwd Packets"] = feature_dict["Total Fwd Packets"]
-                feature_dict[" Total Backward Packets"] = feature_dict["Total Backward Packets"]
-                feature_dict["Total Length of Fwd Packets"] = feature_dict["Total Length of Fwd Packets"]
-                feature_dict[" Total Length of Bwd Packets"] = feature_dict["Total Length of Bwd Packets"]
-                feature_dict[" Flow Packets/s"] = feature_dict["Flow Packets/s"]
                 flow_batch_for_ai.append(feature_dict)
                 flow_keys_in_batch.append(flow_key)
 

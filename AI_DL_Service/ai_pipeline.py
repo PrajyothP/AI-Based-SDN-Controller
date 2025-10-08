@@ -1,42 +1,12 @@
 import keras
 import joblib
+import logging
 import pickle
 import numpy as np
 import os
 import pandas as pd
-import warnings
 
-# Suppress the specific UserWarning from sklearn about feature names
-warnings.filterwarnings("ignore", message="X does not have valid feature names, but MinMaxScaler was fitted with feature names")
-
-# NEW: Added the port encoding logic as requested
-# ==============================================================================
-web = [80,443]
-dns = [53]
-risky = set([4444, 5554, 6666, 6667, 6668, 6669, 31337, 12345, 54321, 135, 139, 445, 8080, 8888, 9000, 17, 19])
-# Add private/ephemeral ports to risky set
-for p in range(49152, 65536):
-  risky.add(p)
-
-well_known = set(v for v in range(1024) if v not in risky and v not in web and v not in dns)
-registered = set(v for v in range(1024, 49152) if v not in risky)
-
-def encode_port(port):
-  if port in web:
-    return 1 # Web
-  elif port in dns:
-    return 2 # DNS
-  elif port in well_known:
-    return 3 # Well-known (Safe)
-  elif port in registered:
-    return 4 # Registered (User)
-  elif port in risky:
-    return 5 # Risky / Ephemeral
-  else:
-    return 5 # Default to risky if somehow uncategorized
-# ==============================================================================
-
-
+# Define the feature names for clarity and order
 AE_FEATURES_ORDER = [
     "Destination Port", "Flow Duration", "Total Fwd Packets", "Total Backward Packets",
     "Total Length of Fwd Packets", "Total Length of Bwd Packets", "Packet Length Mean"
@@ -48,83 +18,188 @@ DDoS_FEATURES_ORDER = [
     "Fwd Packet Length Mean", "Bwd Packet Length Mean", "Flow Packets/s"
 ]
 
+# --- Port Encoding Logic ---
+WEB_PORTS = {80, 443}
+DNS_PORTS = {53}
+# Ports commonly associated with exploits or botnets
+RISKY_PORTS = {4444, 5554, 6666, 6667, 6668, 6669, 31337, 12345, 54321, 135, 139, 445, 8080, 8888, 9000, 17, 19}
+RISKY_PORTS.update(range(49152, 65536)) # Ephemeral/private ports can also be risky
+
+WELL_KNOWN_PORTS = {p for p in range(1024) if p not in RISKY_PORTS and p not in WEB_PORTS and p not in DNS_PORTS}
+REGISTERED_PORTS = {p for p in range(1024, 49152) if p not in RISKY_PORTS}
+
+def encode_port(port):
+    """Encodes a port number into a categorical feature."""
+    if port in WEB_PORTS:
+        return 1  # Web traffic
+    elif port in DNS_PORTS:
+        return 2  # DNS traffic
+    elif port in WELL_KNOWN_PORTS:
+        return 3  # Other well-known service
+    elif port in REGISTERED_PORTS:
+        return 4  # Registered port range
+    else: # This will catch ports in RISKY_PORTS
+        return 5  # Risky or private port
+
 class AIPipeline:
-    def __init__(self, model_dir_relative='models/'):
-        script_dir = os.path.dirname(os.path.realpath(__file__))
-        model_dir = os.path.join(script_dir, model_dir_relative)
+    def __init__(self, model_dir='models/'):
+        """Initializes the AI pipeline by loading all models and scalers."""
         try:
+            # --- Load Autoencoder Components ---
             self.autoencoder = keras.models.load_model(os.path.join(model_dir, 'autoencoder_model.keras'))
+            
+            ae_scaler_path = os.path.join(model_dir, 'scalers/autoencoder/')
+            # Use pickle to load the threshold file
+            with open(os.path.join(ae_scaler_path, 'threshold.pkl'), 'rb') as f:
+                self.ae_threshold = pickle.load(f)
+
+
+            # Load the 6 individual scalers for the autoencoder into a dictionary
+            self.ae_scalers = {
+                # These scalers were likely saved with pickle or joblib.
+                # Use the library they were saved with. Assuming joblib for consistency.
+                "Flow Duration": joblib.load(os.path.join(ae_scaler_path, 'flow_duration_scaler.pkl')),
+                "Total Fwd Packets": joblib.load(os.path.join(ae_scaler_path, 'total_fwd_packets_scaler.pkl')),
+                "Total Backward Packets": joblib.load(os.path.join(ae_scaler_path, 'total_bwd_packets_scaler.pkl')),
+                "Total Length of Fwd Packets": joblib.load(os.path.join(ae_scaler_path, 'total_len_fwd_packets_scaler.pkl')),
+                "Total Length of Bwd Packets": joblib.load(os.path.join(ae_scaler_path, 'total_len_bwd_packets_scaler.pkl')),
+                "Packet Length Mean": joblib.load(os.path.join(ae_scaler_path, 'packet_len_mean_scaler.pkl')),
+            }
+
+            # --- Load DDoS Classifier Components ---
+            ddos_scaler_path = os.path.join(model_dir, 'scalers/ddos/')
             self.ddos_model = keras.models.load_model(os.path.join(model_dir, 'ddos_model.keras'))
             self.forest_embedder = joblib.load(os.path.join(model_dir, 'forest_embedder.joblib'))
-            self.ddos_scaler = joblib.load(os.path.join(model_dir, 'ddos_scaler.joblib'))
-            self.unified_ae_scaler = joblib.load(os.path.join(model_dir, 'unified_ae_scaler.pkl'))
-            with open(os.path.join(model_dir, 'unified_threshold.pkl'), 'rb') as f: self.ae_threshold = pickle.load(f)
-            with open(os.path.join(model_dir, 'forest_emb_max.pkl'), 'rb') as f: self.forest_emb_max = pickle.load(f)
+            self.ddos_scaler = joblib.load(os.path.join(ddos_scaler_path, 'ddos_scaler.joblib'))
+            # Use pickle to load the max value file
+            with open(os.path.join(ddos_scaler_path, 'forest_emb_max.pkl'), 'rb') as f:
+                self.forest_emb_max = pickle.load(f)
+            
             print("✅ AI Pipeline initialized successfully with all components.")
         except FileNotFoundError as e:
-            print(f"FATAL ERROR: A required model file was not found. Searched in: {model_dir}")
-            print(f"Original error: {e}")
+            print(f"FATAL ERROR: A required model file was not found: {e}")
+            print("Please ensure all .keras, .pkl, and .joblib files are in the correct directories.")
             raise
         except Exception as e:
             print(f"FATAL ERROR loading AI models: {e}")
             raise
 
+    def analyze_traffic_flow(self, feature_dict):
+        # ... (The rest of this method is correct) ...
+        # --- Stage 1: Anomaly Detection with Autoencoder ---
+        try:
+            ae_input = []
+            for feature_name in AE_FEATURES_ORDER:
+                raw_value = np.array([[feature_dict[feature_name]]])
+                if feature_name in self.ae_scalers:
+                    scaled_value = self.ae_scalers[feature_name].transform(raw_value)[0][0]
+                    ae_input.append(scaled_value)
+                else:
+                    ae_input.append(raw_value[0][0])
+            ae_input = np.array(ae_input, dtype=np.float32).reshape(1, -1)
+            reconstructed = self.autoencoder.predict(ae_input, verbose=0)
+            error = np.mean(np.square(ae_input - reconstructed))
+            if error < self.ae_threshold:
+                return "NORMAL"
+            print(f"Anomaly detected! Error: {error:.6f} > Threshold: {self.ae_threshold:.6f}")
+        except Exception as e:
+            print(f"Error during anomaly detection: {e}")
+            return "ANALYSIS_ERROR"
+
+        # --- Stage 2: DDoS Classification ---
+        try:
+            df_input = pd.DataFrame([feature_dict])
+            X_input = df_input[DDoS_FEATURES_ORDER].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            X_scaled = self.ddos_scaler.transform(X_input)
+            X_emb = self.forest_embedder.apply(X_scaled).astype(np.float32)
+            X_emb /= self.forest_emb_max
+            prediction_prob = self.ddos_model.predict(X_emb, verbose=0)[0][0]
+            print(prediction_prob)
+            if prediction_prob > 0.3:
+                print(f"Attack classified as DDoS with probability: {prediction_prob:.2f}")
+                return "DDOS"
+            else:
+                print(f"🚦 Attack classified as Congestion.")
+                return "CONGESTION"
+        except Exception as e:
+            print(f"Error during DDoS classification: {e}")
+            return "ANALYSIS_ERROR"
+        
     def analyze_flow_batch(self, flow_batch: list):
+        """
+        Analyzes a batch of flows and returns a list of classifications.
+
+        :param flow_batch: A list of feature dictionaries.
+        :return: A list of strings: "NORMAL", "CONGESTION", or "DDOS".
+        """
         if not flow_batch:
             return []
 
         num_flows = len(flow_batch)
-        default_result = {'label': 'NORMAL', 'probability': 0.0}
-        results = [default_result] * num_flows
+        results = ["NORMAL"] * num_flows # Default classification
 
+        # --- Stage 1: Anomaly Detection with Autoencoder (in Batch) ---
         try:
-            # NEW: Create a copy of the flow batch to encode the destination port for the autoencoder
-            ae_flow_batch = []
-            for flow in flow_batch:
-                flow_copy = flow.copy()
-                flow_copy['Destination Port'] = encode_port(flow_copy['Destination Port'])
-                ae_flow_batch.append(flow_copy)
+            ae_batch = []
+            for feature_dict in flow_batch:
+                ae_input_row = []
+                for feature_name in AE_FEATURES_ORDER:
+                    value = feature_dict[feature_name]
+                    # --- APPLY PORT ENCODING ---
+                    if feature_name == "Destination Port":
+                        encoded_port = encode_port(value)
+                        ae_input_row.append(encoded_port)
+                        continue # Move to the next feature
+                    
+                    raw_value = np.array([[value]])
+                    if feature_name in self.ae_scalers:
+                        scaled_value = self.ae_scalers[feature_name].transform(raw_value)[0][0]
+                        ae_input_row.append(scaled_value)
+                ae_batch.append(ae_input_row)
 
-            # Use the encoded batch to create the DataFrame for the autoencoder
-            df_for_ae = pd.DataFrame(ae_flow_batch)[AE_FEATURES_ORDER]
+            ae_batch = np.array(ae_batch, dtype=np.float32)
             
-            ae_batch_scaled = self.unified_ae_scaler.transform(df_for_ae)
-            reconstructed_batch = self.autoencoder.predict(ae_batch_scaled, verbose=0)
-            errors = np.mean(np.square(ae_batch_scaled - reconstructed_batch), axis=1)
+            reconstructed_batch = self.autoencoder.predict(ae_batch, verbose=0)
+            errors = np.mean(np.square(ae_batch - reconstructed_batch), axis=1)
+
+            # Identify indices of anomalous flows
             anomalous_indices = np.where(errors > self.ae_threshold)[0]
-            
             if anomalous_indices.size == 0:
-                return results
+                return results # All flows are normal
 
             print(f"⚠️  {len(anomalous_indices)} anomalous flows detected for Stage 2 analysis.")
         
         except Exception as e:
             print(f"❌ Error during batch anomaly detection: {e}")
-            return [{'label': 'ANALYSIS_ERROR', 'probability': 0.0}] * num_flows
+            return ["ANALYSIS_ERROR"] * num_flows
 
+        # --- Stage 2: DDoS Classification (on anomalous flows only) ---
         try:
-            # The DDoS stage uses the ORIGINAL flow_batch, as it does not use the port feature.
+            # Create a sub-batch with only the anomalous flows
             ddos_sub_batch = [flow_batch[i] for i in anomalous_indices]
             
             df_input = pd.DataFrame(ddos_sub_batch)
             X_input = df_input[DDoS_FEATURES_ORDER].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
             X_scaled = self.ddos_scaler.transform(X_input)
             X_emb = self.forest_embedder.apply(X_scaled).astype(np.float32)
-            safe_divisor = np.where(self.forest_emb_max == 0, 1.0, self.forest_emb_max)
-            X_emb /= safe_divisor
+            X_emb /= self.forest_emb_max
+            
+            # Get predictions for all anomalous flows in one call
             prediction_probs = self.ddos_model.predict(X_emb, verbose=0)
 
+            # Update results for the anomalous flows
             for i, idx in enumerate(anomalous_indices):
-                prob = prediction_probs[i][0]
-                if prob > 0.3:
-                    results[idx] = {'label': 'DDOS', 'probability': float(prob)}
+                if prediction_probs[i][0] > 0.5:
+                    results[idx] = "DDOS"
                 else:
-                    results[idx] = {'label': 'CONGESTION', 'probability': float(prob)}
+                    results[idx] = "CONGESTION"
             
             return results
 
         except Exception as e:
             print(f"❌ Error during batch DDoS classification: {e}")
+            # Mark all anomalies as ANALYSIS_ERROR if this stage fails
             for idx in anomalous_indices:
-                results[idx] = {'label': 'ANALYSIS_ERROR', 'probability': 0.0}
+                results[idx] = "ANALYSIS_ERROR"
             return results

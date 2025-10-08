@@ -5,6 +5,7 @@ from mininet.node import RemoteController, OVSKernelSwitch
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
 from mininet.link import TCLink
+import sys
 from mininet.topo import Topo
 
 class MyTopo(Topo):
@@ -31,11 +32,12 @@ class MyTopo(Topo):
         for i in range(5):
             self.addLink(switches[i], switches[i+1])
 
-def startNetwork():
+def startNetwork(controller_ip):
     info('*** Creating network\n')
     topo = MyTopo()
     # Make sure this IP is your controller's IP
-    c0 = RemoteController('c0', ip='192.168.64.4', port=6653)
+    info(f'*** Connecting to remote controller at {controller_ip}\n')
+    c0 = RemoteController('c0', ip=controller_ip, port=6653)
     net = Mininet(topo=topo, link=TCLink, controller=c0)
 
     info('*** Starting network\n')
@@ -49,4 +51,9 @@ def startNetwork():
 
 if __name__ == '__main__':
     setLogLevel('info')
-    startNetwork()
+    # Default controller IP if none is provided
+    ctrl_ip = '127.0.0.1'
+    if len(sys.argv) > 1:
+        ctrl_ip = sys.argv[1]
+    
+    startNetwork(controller_ip=ctrl_ip)
