@@ -30,7 +30,8 @@ class AIController(app_manager.RyuApp):
             parser = datapath.ofproto_parser
             match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip_to_block)
             actions = []
-            self.add_flow(datapath, 100, match, actions)
+            # Block rules are permanent (no idle_timeout)
+            self.add_flow(datapath, 100, match, actions, idle_timeout=0)
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
@@ -51,13 +52,17 @@ class AIController(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
+        # The default table-miss rule should be permanent
+        self.add_flow(datapath, 0, match, actions, idle_timeout=0)
 
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=0):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod_args = {'datapath': datapath, 'priority': priority, 'match': match, 'instructions': inst}
+        mod_args = {
+            'datapath': datapath, 'priority': priority, 'match': match, 
+            'instructions': inst, 'idle_timeout': idle_timeout
+        }
         if buffer_id is not None and buffer_id != ofproto.OFP_NO_BUFFER:
             mod_args['buffer_id'] = buffer_id
         mod = parser.OFPFlowMod(**mod_args)
@@ -81,26 +86,25 @@ class AIController(app_manager.RyuApp):
         
         actions = [parser.OFPActionOutput(out_port)]
 
-        # --- THE FIX: Install Layer 3 (IP) based flow rules ---
         if out_port != ofproto.OFPP_FLOOD:
-            # Check if the packet is IP, then create an IP-based match
             ip_pkt = pkt.get_protocol(ipv4.ipv4)
             if ip_pkt:
+                # --- FIX: Add ip_proto to the match criteria ---
                 match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP,
                                         ipv4_src=ip_pkt.src,
                                         ipv4_dst=ip_pkt.dst,
-                                        ip_proto=ip_pkt.proto) # Add IP protocol to match
-                self.add_flow(datapath, 1, match, actions, msg.buffer_id)
-            else: # Fallback for non-IP traffic like ARP
+                                        ip_proto=ip_pkt.proto) # This is the crucial addition
+                # --- FIX: Add an idle_timeout to auto-clear inactive flows ---
+                self.add_flow(datapath, 1, match, actions, msg.buffer_id, idle_timeout=15)
+            else:
                 match = parser.OFPMatch(in_port=in_port, eth_dst=eth.dst)
-                self.add_flow(datapath, 1, match, actions, msg.buffer_id)
-        # --- END FIX ---
+                self.add_flow(datapath, 1, match, actions, msg.buffer_id, idle_timeout=15)
 
         data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
-
+    
     def _flow_monitor(self):
         hub.sleep(10)
         while True:
@@ -108,8 +112,10 @@ class AIController(app_manager.RyuApp):
             for dp in self.datapaths.values():
                 self._request_stats(dp)
             hub.sleep(5)
+            # Simple timer-based cleanup is now effective because switches stop sending stats for timed-out flows
+            self._cleanup_stale_flows()
             self._analyze_flows()
-            hub.sleep(10)
+            hub.sleep(5)
 
     def _request_stats(self, datapath):
         parser = datapath.ofproto_parser
@@ -118,17 +124,19 @@ class AIController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
-        # (The aggregation logic is unchanged and correct)
         body = ev.msg.body
         dpid = ev.msg.datapath.id
         for stat in body:
-            if stat.priority != 1 or 'ipv4_src' not in stat.match: continue
+            # Add a check for ip_proto to ensure we only process relevant flows
+            if stat.priority != 1 or 'ipv4_src' not in stat.match or 'ip_proto' not in stat.match:
+                continue
             
             ip_src = stat.match['ipv4_src']
             ip_dst = stat.match['ipv4_dst']
             port_src = stat.match.get('tcp_src') or stat.match.get('udp_src', 0)
             port_dst = stat.match.get('tcp_dst') or stat.match.get('udp_dst', 0)
 
+            # --- FIX: Use the now-guaranteed ip_proto field in the key ---
             key_part1 = tuple(sorted((ip_src, ip_dst)))
             key_part2 = (stat.match['ip_proto'], tuple(sorted((port_src, port_dst))))
             canonical_key = key_part1 + key_part2
@@ -162,6 +170,16 @@ class AIController(app_manager.RyuApp):
 
             flow_entry['last_update'] = time.time()
 
+    def _cleanup_stale_flows(self):
+        """Removes flows from controller tracking if they haven't been updated recently."""
+        current_time = time.time()
+        stale_keys = [key for key, data in self.flow_stats.items() if (current_time - data['last_update']) > 20]
+        if stale_keys:
+            self.logger.info(f"🗑️  Cleaning up {len(stale_keys)} controller-side stale flows...")
+            for key in stale_keys:
+                if key in self.flow_stats:
+                    del self.flow_stats[key]
+    
     def _analyze_flows(self):
         if not self.flow_stats:
             self.logger.info("No active flows to analyze.")
@@ -171,36 +189,28 @@ class AIController(app_manager.RyuApp):
         flow_keys_in_batch = []
         current_time = time.time()
 
-        for flow_key, data in list(self.flow_stats.items()):
-            if (current_time - data['last_update']) > 20:
-                del self.flow_stats[flow_key]
-                continue
-            
-            duration_sec = data['last_update'] - data['start_time']
+        for flow_key, data in self.flow_stats.items():
+            duration_sec = current_time - data['start_time']
             if duration_sec <= 0: duration_sec = 1e-6
             
             total_packets = data['fwd_packets'] + data['bwd_packets']
             total_bytes = data['fwd_bytes'] + data['bwd_bytes']
             
-            # --- FINAL CORRECTED FEATURE DICTIONARY ---
-            # Creates one dictionary with all features needed by the pipeline.
-            # All names are now clean and space-separated.
-            # Flow Duration is correctly set to microseconds for both models.
+            # This dictionary is now 100% consistent with your training and AI pipeline
             feature_dict = {
                 "Flow Duration": duration_sec * 1_000_000,
                 "Total Fwd Packets": data['fwd_packets'],
                 "Total Backward Packets": data['bwd_packets'],
                 "Total Length of Fwd Packets": data['fwd_bytes'],
                 "Total Length of Bwd Packets": data['bwd_bytes'],
-                "Fwd Packets Length Total": data['fwd_bytes'], # Duplicate for name consistency
-                "Bwd Packets Length Total": data['bwd_bytes'], # Duplicate for name consistency
+                "Fwd Packets Length Total": data['fwd_bytes'],
+                "Bwd Packets Length Total": data['bwd_bytes'],
                 "Fwd Packet Length Mean": data['fwd_bytes'] / data['fwd_packets'] if data['fwd_packets'] > 0 else 0,
                 "Bwd Packet Length Mean": data['bwd_bytes'] / data['bwd_packets'] if data['bwd_packets'] > 0 else 0,
                 "Flow Packets/s": total_packets / duration_sec,
                 "Packet Length Mean": total_bytes / total_packets if total_packets > 0 else 0,
                 "Destination Port": data.get('dst_port', 0)
             }
-
             flow_batch_for_ai.append(feature_dict)
             flow_keys_in_batch.append(flow_key)
 
@@ -210,7 +220,6 @@ class AIController(app_manager.RyuApp):
         self.logger.info(f"🧠 Sending {len(flow_batch_for_ai)} flows to AI API for analysis...")
         
         try:
-            # (API call logic is unchanged and correct)
             response = requests.post(self.ai_api_url, json={'flows': flow_batch_for_ai}, timeout=5)
             response.raise_for_status()
             results = response.json().get('results', [])
@@ -219,13 +228,11 @@ class AIController(app_manager.RyuApp):
             return
 
         for flow_key, result_data in zip(flow_keys_in_batch, results):
-             # (State change logic is unchanged and correct)
             if flow_key not in self.flow_stats: continue
             
             flow_entry = self.flow_stats[flow_key]
             label = result_data.get("label", "UNKNOWN")
             confidence = result_data.get("confidence", 0.0)
-            
             current_state = flow_entry.get('state', 'NEW')
             new_state = current_state
             
