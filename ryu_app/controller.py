@@ -30,8 +30,8 @@ class AIController(app_manager.RyuApp):
             parser = datapath.ofproto_parser
             match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip_to_block)
             actions = []
-            # Block rules are permanent (no idle_timeout)
-            self.add_flow(datapath, 100, match, actions, idle_timeout=0)
+            # Block rules are for 60 secs
+            self.add_flow(datapath, 100, match, actions, idle_timeout=60)
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
