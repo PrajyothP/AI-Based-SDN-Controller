@@ -1,55 +1,51 @@
+# AI-DL_Service/server.py
+
 from flask import Flask, request, jsonify
 from ai_pipeline import AIPipeline
 import logging
+import os
 
-# Configure basic logging
 logging.basicConfig(level=logging.INFO)
-
 app = Flask(__name__)
-
-# --- Global AI Pipeline Instance ---
 pipeline = None
 
 def load_pipeline():
-    """Load the AI pipeline instance."""
     global pipeline
     if pipeline is None:
-        logging.info("🚀 Initializing AI Pipeline for API server...")
+        logging.info("🚀 Initializing AI Pipeline...")
         try:
-            pipeline = AIPipeline()
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(base_dir, 'models')
+            pipeline = AIPipeline(model_dir=model_path)
             logging.info("✅ AI Pipeline loaded successfully.")
         except Exception as e:
             logging.error(f"💀 Failed to load AI pipeline: {e}", exc_info=True)
-            pipeline = None # Ensure it's None if loading fails
+            pipeline = None
     return pipeline
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    """API endpoint to analyze a batch of traffic flows."""
     ai_pipeline = load_pipeline()
     if not ai_pipeline:
-        return jsonify({'error': 'AI pipeline is not available.'}), 503 # Service Unavailable
+        return jsonify({'error': 'AI pipeline is not available.'}), 503
 
     try:
         data = request.get_json()
+        if not data or 'flows' not in data:
+            return jsonify({'error': 'Invalid payload: Missing "flows" key.'}), 400
         
-        # FIX: The key error was here. We must extract the list from the 'flows' key.
-        # The controller sends a JSON object: {'flows': [flow1, flow2, ...]}
-        flow_batch = data.get('flows')
-
-        if not isinstance(flow_batch, list):
-            return jsonify({'error': 'Invalid payload: "flows" key must contain a list.'}), 400
-
-        # Pass the extracted list to the analysis function
-        results = ai_pipeline.analyze_flow_batch(flow_batch)
+        results = ai_pipeline.analyze_flow_batch(data['flows'])
+        
+        labels = [r['label'] for r in results]
+        logging.info(f"🧠 Analysis complete: DDoS={labels.count('DDOS')}, Congestion={labels.count('CONGESTION')}, Normal={labels.count('NORMAL')}")
+        
         return jsonify({'results': results})
 
     except Exception as e:
         logging.error(f"❌ Error during analysis: {e}", exc_info=True)
-        # This will return a 500 Internal Server Error, which is what the controller sees.
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    load_pipeline() # Load the model on startup
+    load_pipeline()
     print(f"🔥 Starting AI API Server on http://127.0.0.1:5000")
-    app.run(host='127.0.0.1', port=5000)
+    app.run(host='0.0.0.0', port=5000)
