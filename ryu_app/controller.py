@@ -1,5 +1,3 @@
-# ryu_app/controller.py
-
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
@@ -18,31 +16,89 @@ class AIController(app_manager.RyuApp):
         super(AIController, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.datapaths = {}
-        self.logger.info("Initializing Final AI SDN Controller...")
+        self.logger.info("Initializing AI-Driven SDN Controller Application...")
         self.flow_stats = {} 
         self.flow_tracking_thread = hub.spawn(self._flow_monitor)
         self.ai_api_url = "http://127.0.0.1:5000/analyze"
-        self.logger.info("✅ AI Controller Initialized. Will connect to API at %s", self.ai_api_url)
+        self.meter_id_counter = 1
+        self.logger.info("AI SDN Controller initialized successfully. API endpoint is configured at: %s", self.ai_api_url)
 
-    def _block_source_ip(self, src_ip_to_block):
-        self.logger.critical("!!! INSTALLING BLOCK RULE for IP: %s !!!", src_ip_to_block)
+    def _apply_llm_rule(self, rule):
+        action = rule.get('action')
+        details = rule.get('details')
+        if not action or not details:
+            self.logger.error("Failed to apply mitigation rule: The received rule object from the AI service is malformed. It is missing the 'action' or 'details' key.")
+            return
+
+        self.logger.critical(f"Applying new network mitigation policy received from AI service. Action: '{action}', Details: {details}")
+
+        if action == 'BLOCK_IP':
+            self._install_block_flow(details)
+        elif action in ['RATE_LIMIT_LOW', 'RATE_LIMIT_HIGH', 'REROUTE_AND_RATE_LIMIT', 'AGGRESSIVE_DROP']:
+            self._install_metered_flow(details)
+        else:
+            self.logger.warning(f"Received an unknown or unsupported action type '{action}' from the AI service. The rule will be ignored.")
+
+    def _install_block_flow(self, details):
+        src_ip = details.get('src_ip')
+        if not src_ip:
+            self.logger.error("Failed to install BLOCK_IP rule: The 'src_ip' was not specified in the rule details.")
+            return
+
+        priority = details.get('priority', 40000)
+        idle_timeout = details.get('idle_timeout', 60)
+        
+        self.logger.critical(f"Installing BLOCK rule on all switches for source IP '{src_ip}'. Priority: {priority}, Idle Timeout: {idle_timeout}s.")
+        
+        match_args = {'eth_type': ether_types.ETH_TYPE_IP, 'ipv4_src': src_ip}
+        if 'dst_ip' in details:
+            match_args['ipv4_dst'] = details['dst_ip']
+
         for datapath in self.datapaths.values():
+            match = datapath.ofproto_parser.OFPMatch(**match_args)
+            self.add_flow(datapath, priority, match, [], idle_timeout=idle_timeout)
+
+    def _install_metered_flow(self, details):
+        rate_mbps = details.get('rate_mbps')
+        src_ip = details.get('src_ip')
+        if not src_ip or rate_mbps is None:
+            self.logger.error("Failed to install metered flow rule: The 'src_ip' or 'rate_mbps' was not specified in the rule details.")
+            return
+
+        priority = details.get('priority', 30000)
+        idle_timeout = details.get('idle_timeout', 60)
+        meter_id = self.meter_id_counter
+        self.meter_id_counter += 1
+
+        self.logger.critical(f"Installing METERED flow rule on all switches for source IP '{src_ip}'. Rate limit: {rate_mbps} Mbps, Meter ID: {meter_id}, Priority: {priority}.")
+
+        match_args = {'eth_type': ether_types.ETH_TYPE_IP, 'ipv4_src': src_ip}
+        if 'dst_ip' in details:
+            match_args['ipv4_dst'] = details['dst_ip']
+
+        for datapath in self.datapaths.values():
+            ofproto = datapath.ofproto
             parser = datapath.ofproto_parser
-            match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip_to_block)
-            actions = []
-            # Block rules are for 60 secs
-            self.add_flow(datapath, 100, match, actions, idle_timeout=60)
+            
+            bands = [parser.OFPMeterBandDrop(rate=int(rate_mbps * 1000), burst_size=int(rate_mbps * 100))]
+            meter_mod = parser.OFPMeterMod(datapath=datapath, command=ofproto.OFPMC_ADD,
+                                           flags=ofproto.OFPMF_KBPS, meter_id=meter_id, bands=bands)
+            datapath.send_msg(meter_mod)
+
+            match = parser.OFPMatch(**match_args)
+            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+            self.add_flow(datapath, priority, match, actions, idle_timeout=idle_timeout, meter_id=meter_id)
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
             if datapath.id not in self.datapaths:
-                self.logger.info('✅ Switch %d connected.', datapath.id)
+                self.logger.info('Switch connected: Datapath ID %s has established a connection with the controller.', datapath.id)
                 self.datapaths[datapath.id] = datapath
         elif ev.state == DEAD_DISPATCHER:
             if datapath.id in self.datapaths:
-                self.logger.warning('❌ Switch %d disconnected.', datapath.id)
+                self.logger.warning('Switch disconnected: Datapath ID %s has lost connection with the controller.', datapath.id)
                 del self.datapaths[datapath.id]
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -52,13 +108,17 @@ class AIController(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        # The default table-miss rule should be permanent
         self.add_flow(datapath, 0, match, actions, idle_timeout=0)
 
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=0):
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=0, meter_id=None):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+        
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        
+        if meter_id is not None:
+            inst.insert(0, parser.OFPInstructionMeter(meter_id=meter_id))
+            
         mod_args = {
             'datapath': datapath, 'priority': priority, 'match': match, 
             'instructions': inst, 'idle_timeout': idle_timeout
@@ -89,12 +149,10 @@ class AIController(app_manager.RyuApp):
         if out_port != ofproto.OFPP_FLOOD:
             ip_pkt = pkt.get_protocol(ipv4.ipv4)
             if ip_pkt:
-                # --- FIX: Add ip_proto to the match criteria ---
                 match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP,
                                         ipv4_src=ip_pkt.src,
                                         ipv4_dst=ip_pkt.dst,
-                                        ip_proto=ip_pkt.proto) # This is the crucial addition
-                # --- FIX: Add an idle_timeout to auto-clear inactive flows ---
+                                        ip_proto=ip_pkt.proto)
                 self.add_flow(datapath, 1, match, actions, msg.buffer_id, idle_timeout=15)
             else:
                 match = parser.OFPMatch(in_port=in_port, eth_dst=eth.dst)
@@ -108,11 +166,10 @@ class AIController(app_manager.RyuApp):
     def _flow_monitor(self):
         hub.sleep(10)
         while True:
-            self.logger.info("--- Polling Cycle Started ---")
+            self.logger.info("Starting new flow statistics polling cycle.")
             for dp in self.datapaths.values():
                 self._request_stats(dp)
             hub.sleep(5)
-            # Simple timer-based cleanup is now effective because switches stop sending stats for timed-out flows
             self._cleanup_stale_flows()
             self._analyze_flows()
             hub.sleep(10)
@@ -127,7 +184,6 @@ class AIController(app_manager.RyuApp):
         body = ev.msg.body
         dpid = ev.msg.datapath.id
         for stat in body:
-            # Add a check for ip_proto to ensure we only process relevant flows
             if stat.priority != 1 or 'ipv4_src' not in stat.match or 'ip_proto' not in stat.match:
                 continue
             
@@ -136,7 +192,6 @@ class AIController(app_manager.RyuApp):
             port_src = stat.match.get('tcp_src') or stat.match.get('udp_src', 0)
             port_dst = stat.match.get('tcp_dst') or stat.match.get('udp_dst', 0)
 
-            # --- FIX: Use the now-guaranteed ip_proto field in the key ---
             key_part1 = tuple(sorted((ip_src, ip_dst)))
             key_part2 = (stat.match['ip_proto'], tuple(sorted((port_src, port_dst))))
             canonical_key = key_part1 + key_part2
@@ -153,14 +208,14 @@ class AIController(app_manager.RyuApp):
             flow_entry = self.flow_stats[canonical_key]
             per_switch_entry = flow_entry['per_switch_stats'][dpid]
 
-            if ip_src == flow_entry['src_ip']: # Forward
+            if ip_src == flow_entry['src_ip']:
                 packet_delta = stat.packet_count - per_switch_entry['fwd_pkts']
                 byte_delta = stat.byte_count - per_switch_entry['fwd_bytes']
                 flow_entry['fwd_packets'] += packet_delta
                 flow_entry['fwd_bytes'] += byte_delta
                 per_switch_entry['fwd_pkts'] = stat.packet_count
                 per_switch_entry['fwd_bytes'] = stat.byte_count
-            else: # Backward
+            else:
                 packet_delta = stat.packet_count - per_switch_entry['bwd_pkts']
                 byte_delta = stat.byte_count - per_switch_entry['bwd_bytes']
                 flow_entry['bwd_packets'] += packet_delta
@@ -171,18 +226,17 @@ class AIController(app_manager.RyuApp):
             flow_entry['last_update'] = time.time()
 
     def _cleanup_stale_flows(self):
-        """Removes flows from controller tracking if they haven't been updated recently."""
         current_time = time.time()
         stale_keys = [key for key, data in self.flow_stats.items() if (current_time - data['last_update']) > 20]
         if stale_keys:
-            self.logger.info(f"🗑️  Cleaning up {len(stale_keys)} controller-side stale flows...")
+            self.logger.info(f"Performing flow table cleanup. Removing {len(stale_keys)} stale flow entries from controller's internal state.")
             for key in stale_keys:
                 if key in self.flow_stats:
                     del self.flow_stats[key]
     
     def _analyze_flows(self):
         if not self.flow_stats:
-            self.logger.info("No active flows to analyze.")
+            self.logger.info("Flow analysis skipped: No active flows are currently being tracked by the controller.")
             return
 
         flow_batch_for_ai = []
@@ -196,7 +250,6 @@ class AIController(app_manager.RyuApp):
             total_packets = data['fwd_packets'] + data['bwd_packets']
             total_bytes = data['fwd_bytes'] + data['bwd_bytes']
             
-            # This dictionary is now 100% consistent with your training and AI pipeline
             feature_dict = {
                 "Flow Duration": duration_sec * 1_000_000,
                 "Total Fwd Packets": data['fwd_packets'],
@@ -219,17 +272,27 @@ class AIController(app_manager.RyuApp):
         if not flow_batch_for_ai:
             return
 
-        self.logger.info(f"🧠 Sending {len(flow_batch_for_ai)} flows to AI API for analysis...")
+        self.logger.info(f"Sending a batch of {len(flow_batch_for_ai)} aggregated flows to the AI analysis service.")
         
+        hub.spawn(self._send_api_request, flow_batch_for_ai, flow_keys_in_batch)
+    
+    def _send_api_request(self, flow_batch, flow_keys):
         try:
-            response = requests.post(self.ai_api_url, json={'flows': flow_batch_for_ai}, timeout=5)
+            response = requests.post(self.ai_api_url, json={'flows': flow_batch}, timeout=30)
             response.raise_for_status()
-            results = response.json().get('results', [])
+            response_data = response.json()
+            results = response_data.get('results', [])
+            actionable_rules = response_data.get('actionable_rules')
+
+            if actionable_rules and isinstance(actionable_rules, list):
+                for rule in actionable_rules:
+                    self._apply_llm_rule(rule)
+
         except requests.exceptions.RequestException as e:
-            self.logger.error("❌ Failed to connect to AI API server: %s", e)
+            self.logger.error("Asynchronous API request to the AI service failed. Error: %s", e)
             return
 
-        for flow_key, result_data in zip(flow_keys_in_batch, results):
+        for flow_key, result_data in zip(flow_keys, results):
             if flow_key not in self.flow_stats: continue
             
             flow_entry = self.flow_stats[flow_key]
@@ -247,15 +310,14 @@ class AIController(app_manager.RyuApp):
 
             log_msg = (
                 f"AI RESULT for flow ({flow_entry['src_ip']}->{flow_entry['dst_ip']}) "
-                f"is [{label}] with conf {confidence:.2%} => state={new_state}"
+                f"is [{label}] with confidence {confidence:.2%} => resulting state={new_state}"
             )
 
             if new_state == 'DDOS' and current_state != 'DDOS':
-                self.logger.critical(f"🚨 STATE CHANGE: {current_state} -> {new_state}. Taking action! {log_msg}")
-                #self._block_source_ip(flow_entry['src_ip'])
+                self.logger.critical(f"Flow State Transition: {current_state} -> {new_state}. A high-confidence threat was detected and a mitigation rule has been applied. Details: {log_msg}")
             elif new_state != current_state:
-                self.logger.warning(f"🚦 STATE CHANGE: {current_state} -> {new_state}. {log_msg}")
+                self.logger.warning(f"Flow State Transition: {current_state} -> {new_state}. Details: {log_msg}")
             else:
-                self.logger.info(f"✅ State unchanged: {current_state}. {log_msg}")
+                self.logger.info(f"Flow State Unchanged: {current_state}. Details: {log_msg}")
             
             flow_entry['state'] = new_state
