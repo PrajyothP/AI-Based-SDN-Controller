@@ -115,7 +115,7 @@ class AIController(app_manager.RyuApp):
             # Simple timer-based cleanup is now effective because switches stop sending stats for timed-out flows
             self._cleanup_stale_flows()
             self._analyze_flows()
-            hub.sleep(5)
+            hub.sleep(10)
 
     def _request_stats(self, datapath):
         parser = datapath.ofproto_parser
@@ -209,7 +209,9 @@ class AIController(app_manager.RyuApp):
                 "Bwd Packet Length Mean": data['bwd_bytes'] / data['bwd_packets'] if data['bwd_packets'] > 0 else 0,
                 "Flow Packets/s": total_packets / duration_sec,
                 "Packet Length Mean": total_bytes / total_packets if total_packets > 0 else 0,
-                "Destination Port": data.get('dst_port', 0)
+                "Destination Port": data.get('dst_port', 0),
+                "src_ip": data['src_ip'],
+                "dst_ip": data['dst_ip']
             }
             flow_batch_for_ai.append(feature_dict)
             flow_keys_in_batch.append(flow_key)
@@ -250,7 +252,7 @@ class AIController(app_manager.RyuApp):
 
             if new_state == 'DDOS' and current_state != 'DDOS':
                 self.logger.critical(f"🚨 STATE CHANGE: {current_state} -> {new_state}. Taking action! {log_msg}")
-                self._block_source_ip(flow_entry['src_ip'])
+                #self._block_source_ip(flow_entry['src_ip'])
             elif new_state != current_state:
                 self.logger.warning(f"🚦 STATE CHANGE: {current_state} -> {new_state}. {log_msg}")
             else:

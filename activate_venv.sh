@@ -2,4 +2,4 @@ source /home/prajyoth/sdn/bin/activate
 
 source /home/prajyoth/ai-venv/bin/activate
 
-763c64c37ccf94f1811a13dea0993906e1bd1b06 - fallback commit hash (working autoencoder)
+b2524810970d547b3e30a9a762dc670a21fbf9ce - fallback commit hash (everthing without AI)
