@@ -19,217 +19,168 @@ OLLAMA_API_URL = f"http://{OLLAMA_HOST_IP}:11434/api/generate"
 
 FEW_SHOT_PROMPT_TEMPLATE = """
 [INST]
-As an expert SDN security analyst, your task is to generate a JSON array of flow rules, one for each alert provided below. The rule for each alert must be a specific, actionable mitigation. Your response must be only the JSON array and nothing else.
+As an expert SDN security analyst, your task is to generate a simple, pipe-separated mitigation rule for each alert. Your response must be only the rules and nothing else.
 
-**Rule Format:**
-- The JSON object must contain "action" and "details".
-- "action" can be: "BLOCK_IP", "RATE_LIMIT_LOW", "RATE_LIMIT_HIGH", "REROUTE_AND_RATE_LIMIT", or "AGGRESSIVE_DROP".
-- "details" must contain the specific parameters for the action.
-
----
-**== DDoS Examples ==**
-
-**Example 1: High-Confidence DDoS Attack (>60%)**
-Alert: "High-confidence (98%) DDoS attack detected from source IP 10.0.0.16."
-Your JSON Response:
-{{
-  "action": "BLOCK_IP",
-  "details": {{
-    "src_ip": "10.0.0.16",
-    "priority": 40000,
-    "idle_timeout": 60
-  }}
-}}
-
-**Example 2: Low-Confidence DDoS Attack (<60%)**
-Alert: "Low-confidence (55%) DDoS attack detected from source IP 10.0.0.17."
-Your JSON Response:
-{{
-  "action": "RATE_LIMIT_HIGH",
-  "details": {{
-    "src_ip": "10.0.0.17",
-    "rate_mbps": 5,
-    "priority": 30000
-  }}
-}}
+**Rule Format and Logic:**
+- Generate one rule per line in the format: `ACTION | parameter=value | ...`
+- **Use the AI's confidence score to decide the action's severity:**
+  - **High-Confidence Threat (>85%):** Use an aggressive action like `BLOCK_IP`.
+  - **Medium-Confidence Threat (60-85%):** Use a firm action like `RATE_LIMIT_HIGH`.
+  - **Low-Confidence Threat (<60%):** Use a cautious action like `RATE_LIMIT_LOW`.
+- **Use the Recent Mitigation History to identify repeat offenders.** If you see the same IP in the history, consider escalating the action (e.g., from `RATE_LIMIT` to `BLOCK_IP`).
 
 ---
-**== Congestion Examples ==**
+**== Alert Examples and Your Corresponding Responses ==**
 
-**Example 3: Severe Congestion (80-100%)**
-Alert: "High-confidence (95%) congestion detected for flow from 10.0.0.2 to 10.0.0.18."
-Your JSON Response:
-{{
-  "action": "AGGRESSIVE_DROP",
-  "details": {{
-    "src_ip": "10.0.0.2",
-    "dst_ip": "10.0.0.18",
-    "rate_mbps": 2,
-    "priority": 20000
-  }}
-}}
+**Alert:** "High-confidence (98%) DDoS attack detected from source IP 10.0.0.16."
+**Your Response:**
+BLOCK_IP | src_ip=10.0.0.16 | priority=40000
 
-**Example 4: Moderate Congestion (40-80%)**
-Alert: "Moderate-confidence (65%) congestion detected for flow from 10.0.0.3 to 10.0.0.15."
-Your JSON Response:
-{{
-  "action": "REROUTE_AND_RATE_LIMIT",
-  "details": {{
-    "src_ip": "10.0.0.3",
-    "dst_ip": "10.0.0.15",
-    "rate_mbps": 10
-  }}
-}}
+**Alert:** "Medium-confidence (75%) DDoS attack detected from source IP 10.0.0.17."
+**Your Response:**
+RATE_LIMIT_HIGH | src_ip=10.0.0.17 | rate_mbps=5 | priority=30000
 
-**Example 5: Low-Level Congestion (0-40%)**
-Alert: "Low-confidence (25%) congestion detected for flow from 10.0.0.4 to 10.0.0.12."
-Your JSON Response:
-{{
-  "action": "RATE_LIMIT_LOW",
-  "details": {{
-    "src_ip": "10.0.0.4",
-    "dst_ip": "10.0.0.12",
-    "rate_mbps": 50
-  }}
-}}
+**Alert:** "Low-confidence (55%) congestion detected for flow from 10.0.0.4 to 10.0.0.12."
+**Your Response:**
+RATE_LIMIT_LOW | src_ip=10.0.0.4 | dst_ip=10.0.0.12 | rate_mbps=50
 
 ---
 **== Multi-Alert Example ==**
-
 Alerts:
-1. "Low-confidence (55%) DDoS attack detected from source IP 10.0.0.17."
-2. "Moderate-confidence (65%) congestion detected for flow from 10.0.0.3 to 10.0.0.15."
+1. "Medium-confidence (65%) DDoS attack detected from source IP 10.0.0.17."
+2. "High-confidence (95%) congestion detected for flow from 10.0.0.3 to 10.0.0.15."
 
-Your JSON Response:
-[
-  {{
-    "action": "RATE_LIMIT_HIGH",
-    "details": {{
-      "src_ip": "10.0.0.17",
-      "rate_mbps": 5,
-      "priority": 30000
-    }}
-  }},
-  {{
-    "action": "REROUTE_AND_RATE_LIMIT",
-    "details": {{
-      "src_ip": "10.0.0.3",
-      "dst_ip": "10.0.0.15",
-      "rate_mbps": 10
-    }}
-  }}
-]
+Your Response:
+RATE_LIMIT_HIGH | src_ip=10.0.0.17 | rate_mbps=5
+AGGRESSIVE_DROP | src_ip=10.0.0.3 | dst_ip=10.0.0.15 | rate_mbps=2
 
 ---
 **== Recent Mitigation History (Last 10 Actions) ==**
 {mitigation_history}
 
 ---
-Now, based on the examples AND the recent history above, generate the appropriate JSON array of rules for the following alerts. Pay close attention to repeat offenders in the history.
-Your response must be only the JSON array and nothing else.
+Now, follow all instructions above to generate one simple, pipe-separated rule for each of the following alerts.
 
 **Current Alerts:**
 {alert_summary}
 [/INST]
 """
 
+def parse_simple_rule_format(line: str):
+    try:
+        # --- FIX: Sanitize the line to remove conversational filler before parsing ---
+        # This regex removes patterns like "Rule 1:", "**Rule 1:** ", "1. ", etc. from the start.
+        sanitized_line = re.sub(r'^\s*(\*\*Rule\s*\d+:\*\*|Rule\s*\d+:|\d+\.)\s*', '', line, flags=re.IGNORECASE).strip()
+
+        parts = [p.strip() for p in sanitized_line.split('|')]
+        if not parts or len(parts) < 2:
+            return None
+        
+        action = parts[0]
+        details = {}
+        for param in parts[1:]:
+            if '=' not in param: continue
+            key, value = param.split('=', 1)
+            key = key.strip()
+            value = value.strip()
+            if value.isdigit():
+                details[key] = int(value)
+            else:
+                try:
+                    details[key] = float(value)
+                except ValueError:
+                    details[key] = value
+        
+        return {"action": action, "details": details}
+    except Exception as e:
+        logging.error(f"Failed to parse simple rule format for line: '{line}'. Error: {e}")
+        return None
+
+
 def validate_and_correct_llm_rule(rule, actual_src_ip, actual_dst_ip):
     VALID_ACTIONS = {"BLOCK_IP", "RATE_LIMIT_LOW", "RATE_LIMIT_HIGH", "REROUTE_AND_RATE_LIMIT", "AGGRESSIVE_DROP"}
+    
     if not isinstance(rule, dict) or "action" not in rule or "details" not in rule:
-        logging.error(f"LLM Response Validation Failed: Rule is missing 'action' or 'details' keys. Rule content: {rule}")
-        return None
-    if not isinstance(rule['details'], dict):
-        logging.error(f"LLM Response Validation Failed: The 'details' key does not contain a dictionary. Rule content: {rule}")
+        logging.error(f"Rule validation failed: Missing 'action' or 'details'. Rule: {rule}")
         return None
 
     if rule['action'] not in VALID_ACTIONS:
-        if rule['action'].upper() == "BLACKLIST":
-            rule['action'] = "BLOCK_IP"
-        else:
-            logging.error(f"LLM Response Validation Failed: Invalid action '{rule['action']}' provided.")
-            return None
+        logging.error(f"Rule validation failed: Invalid action '{rule['action']}'.")
+        return None
 
     details = rule['details']
     clean_details = {}
-    if 'src_ip' not in details or details['src_ip'] != actual_src_ip:
-        logging.warning(f"Correcting mismatched source IP in LLM response. Alert IP: '{actual_src_ip}', LLM IP: '{details.get('src_ip')}'. Overwriting with actual source IP.")
+    if 'src_ip' not in details:
+        logging.warning(f"LLM response did not include src_ip. Manually adding from context: {actual_src_ip}")
     clean_details['src_ip'] = actual_src_ip
-    if 'dst_ip' in details and details['dst_ip'] != actual_dst_ip:
-        logging.warning(f"Correcting mismatched destination IP in LLM response. Alert IP: '{actual_dst_ip}', LLM IP: '{details.get('dst_ip')}'. Overwriting with actual destination IP.")
-    if actual_dst_ip != 'N/A':
-         clean_details['dst_ip'] = actual_dst_ip
 
-    if 'rate_mbps' in details and isinstance(details['rate_mbps'], (int, float)):
+    if actual_dst_ip != 'N/A' and 'dst_ip' in details:
+         clean_details['dst_ip'] = details['dst_ip']
+
+    if 'rate_mbps' in details:
         clean_details['rate_mbps'] = details['rate_mbps']
-    priority = details.get('priority', details.get('prsion'))
-    if priority and isinstance(priority, int):
-        clean_details['priority'] = priority
-    if 'idle_timeout' in details and isinstance(details['idle_timeout'], int):
+    if 'priority' in details:
+        clean_details['priority'] = details['priority']
+    if 'idle_timeout' in details:
         clean_details['idle_timeout'] = details['idle_timeout']
         
     validated_rule = {"action": rule['action'], "details": clean_details}
-    logging.info(f"LLM response successfully validated and sanitized. Final rule: {json.dumps(validated_rule, indent=2)}")
+    logging.info(f"LLM response successfully parsed and validated. Final rule: {json.dumps(validated_rule, indent=2)}")
     return validated_rule
 
 def call_llm(prompt: str, flows_for_validation: list, is_priming=False):
     global LLM_DECISION_HISTORY
     try:
         if is_priming:
-            logging.info("Sending priming prompt to Large Language Model with network topology context.")
+            logging.info("Sending priming prompt to Large Language Model.")
             final_prompt = prompt
         else:
             logging.info(f"Generating mitigation rules via LLM for {len(flows_for_validation)} alerts.")
-            if not LLM_DECISION_HISTORY:
-                history_str = "No recent actions taken."
-            else:
-                history_entries = [f"- Action: {item['action']}, Details: {item['details']}" for item in LLM_DECISION_HISTORY]
-                history_str = "\n".join(history_entries)
+            history_str = "\n".join([f"- {item['action']} | {' | '.join([f'{k}={v}' for k, v in item['details'].items()])}" for item in LLM_DECISION_HISTORY]) if LLM_DECISION_HISTORY else "No recent actions taken."
             final_prompt = FEW_SHOT_PROMPT_TEMPLATE.format(alert_summary=prompt, mitigation_history=history_str)
 
-        payload = {"model": "gemma:2b", "prompt": final_prompt, "stream": False, "options": {"temperature" : 0.2}}
+        payload = {"model": "gemma:2b", "prompt": final_prompt, "stream": False, "options": {"temperature": 0.1}}
         response = requests.post(OLLAMA_API_URL, data=json.dumps(payload), timeout=120)
         response.raise_for_status()
-        llm_response_text = response.json().get('response', '[]')
+        llm_response_text = response.json().get('response', '')
 
         if is_priming:
             logging.info("LLM priming successfully completed.")
             return None
         
-        json_match = re.search(r'\[.*\]', llm_response_text, re.DOTALL)
-        if not json_match:
-            logging.error(f"LLM response parsing error: No valid JSON array found in the response text. Full response: {llm_response_text.strip()}")
+        parsed_rules = []
+        lines = llm_response_text.strip().split('\n')
+        for line in lines:
+            if line:
+                rule = parse_simple_rule_format(line)
+                if rule:
+                    parsed_rules.append(rule)
+        
+        if not parsed_rules:
+            logging.error(f"LLM response parsing error: Could not extract any valid rules. Full response: {llm_response_text.strip()}")
             return None
 
-        json_string = json_match.group(0)
         validated_rules = []
-        try:
-            parsed_rules = json.loads(json_string)
-            if not isinstance(parsed_rules, list):
-                logging.error(f"LLM did not return a list. Response: {parsed_rules}")
-                return None
-            
-            if len(parsed_rules) != len(flows_for_validation):
-                logging.warning(f"LLM returned {len(parsed_rules)} rules for {len(flows_for_validation)} alerts. Proceeding with caution.")
+        if len(parsed_rules) != len(flows_for_validation):
+            logging.warning(f"LLM returned {len(parsed_rules)} rules for {len(flows_for_validation)} alerts. Proceeding with caution.")
 
-            for i, rule in enumerate(parsed_rules):
-                if i >= len(flows_for_validation): break
-                flow_info = flows_for_validation[i]
-                actual_src = flow_info.get('src_ip', 'N/A')
-                actual_dst = flow_info.get('dst_ip', 'N/A')
-                
-                validated_rule = validate_and_correct_llm_rule(rule, actual_src, actual_dst)
-                if validated_rule:
-                    validated_rules.append(validated_rule)
+        for i, rule in enumerate(parsed_rules):
+            if i >= len(flows_for_validation): break
+            validation_context = flows_for_validation[i]
+            flow_info = validation_context['flow']
+            actual_src = flow_info.get('src_ip', 'N/A')
+            actual_dst = flow_info.get('dst_ip', 'N/A')
             
-            if validated_rules:
-                for rule in validated_rules:
-                    LLM_DECISION_HISTORY.append(rule)
-                logging.info(f"LLM decision history updated with {len(validated_rules)} new rules. Current history size: {len(LLM_DECISION_HISTORY)} decisions.")
-            
-            return validated_rules
-        except json.JSONDecodeError as e:
-            logging.error(f"JSON Decode Error: Failed to parse the extracted JSON array from LLM response. String was: '{json_string.strip()}'. Error details: {e}")
-            return None
+            validated_rule = validate_and_correct_llm_rule(rule, actual_src, actual_dst)
+            if validated_rule:
+                validated_rules.append(validated_rule)
+        
+        if validated_rules:
+            for rule in validated_rules:
+                LLM_DECISION_HISTORY.append(rule)
+            logging.info(f"LLM decision history updated with {len(validated_rules)} new rules. Current history size: {len(LLM_DECISION_HISTORY)} decisions.")
+        
+        return validated_rules
 
     except Exception as e:
         logging.error(f"An exception occurred during communication with the Ollama LLM API: {e}")
@@ -271,14 +222,7 @@ def analyze():
             flow = flow_batch[i]
             if res['label'] == 'DDOS' and res['confidence'] > 0.90:
                 logging.critical(f"High-Confidence DDoS (>90%) detected from {flow.get('src_ip', 'N/A')}. Applying direct block rule.")
-                hard_rule = {
-                    "action": "BLOCK_IP",
-                    "details": {
-                        "src_ip": flow.get('src_ip', 'N/A'),
-                        "priority": 45000,
-                        "idle_timeout": 60
-                    }
-                }
+                hard_rule = { "action": "BLOCK_IP", "details": { "src_ip": flow.get('src_ip', 'N/A'), "priority": 45000, "idle_timeout": 60 } }
                 actionable_rules.append(hard_rule)
                 LLM_DECISION_HISTORY.append(hard_rule)
             elif res['label'] in ['DDOS', 'CONGESTION']:
@@ -299,19 +243,18 @@ def analyze():
                 dst_ip = flow.get('dst_ip', 'N/A')
                 threat_label = "DDoS attack" if res['label'] == 'DDOS' else "congestion"
                 
-                if res['label'] == 'DDOS':
-                    conf_level = "High-confidence" if confidence_percent > 60 else "Low-confidence"
-                else:
+                if res['label'] == 'DDOS': 
+                    if confidence_percent > 85: conf_level = "High-confidence"
+                    elif confidence_percent > 60: conf_level = "Medium-confidence"
+                    else: conf_level = "Low-confidence"
+                else: # Congestion
                     if confidence_percent > 80: conf_level = "High-confidence"
                     elif confidence_percent > 40: conf_level = "Moderate-confidence"
                     else: conf_level = "Low-confidence"
                 
-                alert_text = (
-                    f"{idx+1}. {conf_level} ({confidence_percent:.0f}%) {threat_label} detected "
-                    f"from source IP {src_ip} to destination IP {dst_ip}."
-                )
+                alert_text = (f"{idx+1}. {conf_level} ({confidence_percent:.0f}%) {threat_label} detected from source IP {src_ip} to destination IP {dst_ip}.")
                 alerts_for_llm.append(alert_text)
-                flow_data_for_validation.append(flow)
+                flow_data_for_validation.append({'flow': flow, 'result': res})
 
             alert_summary_string = "\n".join(alerts_for_llm)
             llm_rules = call_llm(alert_summary_string, flows_for_validation=flow_data_for_validation)
